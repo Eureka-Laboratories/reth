@@ -153,13 +153,27 @@ impl<'a, H: NippyJarHeader> NippyJarCursor<'a, H> {
         let offset_pos = self.row as usize * self.jar.columns + column;
         let value_offset = self.reader.offset(offset_pos)? as usize;
 
-        let column_offset_range = if self.jar.rows * self.jar.columns == offset_pos + 1 {
-            // It's the last column of the last row
-            value_offset..self.reader.size()
-        } else {
-            let next_value_offset = self.reader.offset(offset_pos + 1)? as usize;
-            value_offset..next_value_offset
-        };
+        // Bound the value by the next committed offset — including for the last column of the
+        // last row, whose end bound is the final offset in the offsets file (maintained by the
+        // writer as the committed data-file length). Never bound a value by the *current* data
+        // file length: a reader of a live jar can observe data-file bytes that a writer has
+        // appended but not committed yet, and using the mapped length as the end bound would
+        // silently include that uncommitted tail in the returned value (torn read).
+        let next_value_offset = self.reader.offset(offset_pos + 1)? as usize;
+
+        // Validate the committed range against the mapped data file before slicing or
+        // decompressing, so a torn or inconsistent view fails closed instead of panicking.
+        if value_offset > next_value_offset || next_value_offset > self.reader.size() {
+            return Err(NippyJarError::InvalidOffsetRange {
+                start: value_offset as u64,
+                end: next_value_offset as u64,
+                size: self.reader.size() as u64,
+                row: self.row,
+                column: column as u64,
+            })
+        }
+
+        let column_offset_range = value_offset..next_value_offset;
 
         if let Some(compression) = self.jar.compressor() {
             let from = self.internal_buffer.len();

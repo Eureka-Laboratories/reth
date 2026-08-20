@@ -65,6 +65,27 @@ pub enum NippyJarError {
         index: usize,
     },
 
+    /// A committed offset range is invalid with respect to the mapped data file.
+    ///
+    /// Returned instead of reading past the committed end of a value, e.g. when a reader
+    /// observes data-file bytes appended by a writer that has not committed the matching
+    /// offsets yet, or when the mapped data file is shorter than the committed offsets claim.
+    #[error(
+        "invalid committed offset range for row {row} column {column}: start {start}, end {end}, mapped data size {size}"
+    )]
+    InvalidOffsetRange {
+        /// Committed start offset of the value.
+        start: u64,
+        /// Committed end offset of the value.
+        end: u64,
+        /// Length of the mapped data file.
+        size: u64,
+        /// Row of the value being read.
+        row: u64,
+        /// Column of the value being read.
+        column: u64,
+    },
+
     /// The output buffer is too small for the compression or decompression operation.
     #[error("compression or decompression requires a bigger destination output")]
     OutputTooSmall,

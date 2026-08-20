@@ -837,6 +837,112 @@ mod tests {
         }
     }
 
+    /// Regression test for the external-reader torn read of a live jar.
+    ///
+    /// A writer appends data-file bytes before it commits the matching offsets (and config), so
+    /// a reader that maps the files inside that window observes a data file that is longer than
+    /// the committed offsets claim. The reader must return exactly the committed rows — the last
+    /// committed row must never be extended with the uncommitted tail.
+    ///
+    /// The torn view is produced on disk and read through fresh mmaps, which is the same view a
+    /// separate reader process observes (`NippyJar` keeps no cross-handle state in memory). A
+    /// process-level version of this scenario runs in the ebuilder storage-v2 experiment
+    /// harness.
+    #[test]
+    fn test_reader_torn_append_returns_exact_committed_rows() {
+        // Uncompressed: on an unpatched cursor the torn last row silently *returns wrong data*
+        // (committed bytes + uncommitted tail), which is the worst failure mode.
+        let (col1, col2) = test_data(Some(42));
+        let num_columns = 2;
+        let file_path = tempfile::NamedTempFile::new().unwrap();
+
+        append_two_rows(num_columns, file_path.path(), &col1, &col2);
+        grow_data_file_without_commit(file_path.path(), &col1, &col2);
+
+        // Fresh load + fresh mmaps over the torn on-disk view.
+        let nippy = NippyJar::load_without_header(file_path.path()).unwrap();
+        assert_eq!(nippy.rows, 2, "config must still show the committed row count");
+
+        let mut cursor = NippyJarCursor::new(&nippy).unwrap();
+        for (row_index, (v1, v2)) in col1.iter().zip(col2.iter()).enumerate().take(nippy.rows) {
+            let row = cursor.row_by_number(row_index).unwrap().unwrap();
+            assert_eq!(
+                (row[0], row[1]),
+                (&v1[..], &v2[..]),
+                "committed row {row_index} must be byte-exact and exclude any uncommitted tail"
+            );
+        }
+    }
+
+    /// Same scenario as [`test_reader_torn_append_returns_exact_committed_rows`], but with lz4
+    /// compression (the production static-file configuration): on an unpatched cursor the torn
+    /// last row feeds committed-plus-tail bytes to the decompressor, which either errors or
+    /// produces garbage that panics downstream decoders.
+    #[test]
+    fn test_reader_torn_append_returns_exact_committed_rows_lz4() {
+        let (col1, col2) = test_data(Some(43));
+        let num_columns = 2;
+        let file_path = tempfile::NamedTempFile::new().unwrap();
+
+        // Create with lz4 and commit two rows.
+        {
+            let nippy =
+                NippyJar::new_without_header(num_columns, file_path.path()).with_lz4();
+            nippy.freeze_config().unwrap();
+            let mut writer = NippyJarWriter::new(nippy).unwrap();
+            writer.append_column(Some(Ok(&col1[0]))).unwrap();
+            writer.append_column(Some(Ok(&col2[0]))).unwrap();
+            writer.append_column(Some(Ok(&col1[1]))).unwrap();
+            writer.append_column(Some(Ok(&col2[1]))).unwrap();
+            writer.commit().unwrap();
+        }
+        grow_data_file_without_commit(file_path.path(), &col1, &col2);
+
+        let nippy = NippyJar::load_without_header(file_path.path()).unwrap();
+        assert_eq!(nippy.rows, 2, "config must still show the committed row count");
+
+        let mut cursor = NippyJarCursor::new(&nippy).unwrap();
+        for (row_index, (v1, v2)) in col1.iter().zip(col2.iter()).enumerate().take(nippy.rows) {
+            let row = cursor.row_by_number(row_index).unwrap().unwrap();
+            assert_eq!(
+                (row[0], row[1]),
+                (&v1[..], &v2[..]),
+                "committed row {row_index} must decompress byte-exact and exclude any \
+                 uncommitted tail"
+            );
+        }
+    }
+
+    /// Grows the data file with a third row's bytes without committing offsets or config,
+    /// reproducing the window between a writer's data append and its offsets/config commit.
+    /// Same mechanism as [`test_append_consistency_no_commit`], which asserts the on-disk
+    /// effect (data grew, offsets unchanged).
+    fn grow_data_file_without_commit(file_path: &Path, col1: &[Vec<u8>], col2: &[Vec<u8>]) {
+        let nippy = NippyJar::load_without_header(file_path).unwrap();
+        let initial_data_size =
+            File::open(nippy.data_path()).unwrap().metadata().unwrap().len();
+        let initial_offset_size =
+            File::open(nippy.offsets_path()).unwrap().metadata().unwrap().len();
+
+        let mut writer = NippyJarWriter::new(nippy).unwrap();
+        writer.append_column(Some(Ok(&col1[2]))).unwrap();
+        writer.append_column(Some(Ok(&col2[2]))).unwrap();
+        // Dropping the writer flushes buffered data bytes to disk but commits nothing.
+        drop(writer);
+
+        let nippy = NippyJar::load_without_header(file_path).unwrap();
+        assert!(
+            File::open(nippy.data_path()).unwrap().metadata().unwrap().len() >
+                initial_data_size,
+            "data file must have grown past the committed end"
+        );
+        assert_eq!(
+            File::open(nippy.offsets_path()).unwrap().metadata().unwrap().len(),
+            initial_offset_size,
+            "offsets file must be unchanged (nothing committed)"
+        );
+    }
+
     fn test_append_consistency_partial_commit(
         file_path: &Path,
         col1: &[Vec<u8>],
