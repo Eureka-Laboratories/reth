@@ -74,7 +74,11 @@ where
             compute_storage_changesets(&mut storage_cursor, storage_updates)?
         };
 
-        if !storage_changesets.is_empty() {
+        // A wiped storage trie has to be recorded even when it had no persisted nodes to collect.
+        // The deletion marker is what tells an unwind to drop the trie, and a small storage trie
+        // holds no branch nodes at all, so dropping the entry here loses the wipe entirely and
+        // diverges from the aggregate DB computation, which always reports it.
+        if !storage_changesets.is_empty() || storage_updates.is_deleted() {
             storage_tries.insert(
                 *hashed_address,
                 StorageTrieUpdatesSorted {
