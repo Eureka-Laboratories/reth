@@ -179,6 +179,10 @@ type ReceiptRootSender<N> =
     crossbeam_channel::Sender<IndexedReceipt<<N as NodePrimitives>::Receipt>>;
 type ReceiptRootReceiver = tokio::sync::oneshot::Receiver<(B256, alloy_primitives::Bloom)>;
 
+/// Parent-anchored provider used to eagerly compute a block's trie changesets.
+type ChangesetProvider<P, N> =
+    <OverlayStateProviderFactory<P, N> as DatabaseProviderROFactory>::Provider;
+
 /// Context providing access to tree state during validation.
 ///
 /// This context is provided to the [`EngineValidator`] and includes the state of the tree's
@@ -315,8 +319,9 @@ where
         + StateReader
         + Clone
         + 'static,
-    OverlayStateProviderFactory<P, N>: DatabaseProviderROFactory<Provider: TrieCursorFactory + HashedCursorFactory>
-        + Clone
+    OverlayStateProviderFactory<P, N>: DatabaseProviderROFactory<
+            Provider: TrieCursorFactory + HashedCursorFactory + Send + 'static,
+        > + Clone
         + 'static,
     Evm: ConfigureEvm<Primitives = N> + 'static,
 {
@@ -595,6 +600,10 @@ where
         let provider_factory = self.provider.clone();
         let overlay_builder = ctx.state().tree_state.overlay_manager.overlay_builder(parent_hash);
         let overlay_factory = OverlayStateProviderFactory::new(provider_factory, overlay_builder);
+
+        // Build this before execution so the overlay is anchored at the parent while it is still
+        // the tip of the in-memory chain. `None` unless eager changeset caching is enabled.
+        let changeset_provider = self.changeset_provider_for(&overlay_factory);
 
         let parallel_bal_execution = ensure_ok!(self.bal_path_eligible(env.decoded_bal.as_deref()));
 
@@ -895,8 +904,13 @@ where
             let _ = valid_block_tx.send(());
         }
 
-        let executed_block =
-            self.spawn_deferred_trie_task(Arc::new(block), output, hashed_state, trie_output);
+        let executed_block = self.spawn_deferred_trie_task(
+            Arc::new(block),
+            output,
+            hashed_state,
+            trie_output,
+            changeset_provider,
+        );
         let raw_bal = decoded_bal.map(|decoded_bal| decoded_bal.as_raw_bal().clone());
         Ok(ValidationOutput::new(executed_block, timing_stats).with_raw_bal(raw_bal))
     }
@@ -1496,6 +1510,7 @@ where
         execution_outcome: Arc<BlockExecutionOutput<N::Receipt>>,
         hashed_state: LazyHashedPostState,
         trie_output: Arc<TrieUpdates>,
+        changeset_provider: Option<ChangesetProvider<P, N>>,
     ) -> ExecutedBlock<N> {
         // Create deferred handle and task that owns the unsorted inputs.
         // Resolve the lazy handle into Arc<HashedPostState>. By this point the hashed state has
@@ -1510,6 +1525,13 @@ where
 
         // Capture block info for tracing.
         let block_number = block.number();
+
+        // Register the pending changeset before spawning so a consumer that asks for this block
+        // between now and the computation finishing waits on us instead of running the aggregate
+        // DB fallback. `None` unless eager changeset caching is enabled.
+        let pending_changeset_guard = changeset_provider
+            .as_ref()
+            .map(|_| self.overlay_manager.register_pending_changeset(block_number, block.hash()));
 
         // Spawn background task to compute trie data.
         let compute_trie_input_task = move || {
@@ -1533,12 +1555,73 @@ where
             block_validation_metrics
                 .trie_updates_sorted_size
                 .record(computed.sorted.trie_updates.total_len() as f64);
+
+            // Compute and cache this block's trie changesets from the trie updates we just
+            // published. `changeset_provider` is anchored at the parent, so it reads the trie as
+            // it was before this block, which is exactly what a revert of this block restores.
+            //
+            // Publishing trie data first means trie-data waiters never block on this step. If it
+            // fails, the guard drops unresolved and waiters fall through to the DB fallback.
+            let (Some(changeset_provider), Some(guard)) =
+                (changeset_provider, pending_changeset_guard)
+            else {
+                return
+            };
+
+            let changeset_start = Instant::now();
+            match reth_trie::changesets::compute_trie_changesets(
+                &changeset_provider,
+                &computed.sorted.trie_updates,
+            ) {
+                Ok(changesets) => {
+                    debug!(
+                        target: "engine::tree::changeset",
+                        block_number,
+                        elapsed = ?changeset_start.elapsed(),
+                        "Computed and caching changesets"
+                    );
+                    guard.resolve(Arc::new(changesets));
+                }
+                Err(err) => {
+                    warn!(
+                        target: "engine::tree::changeset",
+                        block_number,
+                        %err,
+                        "Failed to compute changesets for deferred trie producer"
+                    );
+                }
+            }
         };
 
         // Spawn task that computes trie data asynchronously.
         self.runtime.spawn_blocking_named(DEFERRED_TRIE_WORKER_NAME, compute_trie_input_task);
 
         ExecutedBlock::with_deferred_trie_data(block, execution_outcome, deferred_trie_data)
+    }
+
+    /// Builds the parent-anchored provider used to compute this block's trie changesets.
+    ///
+    /// Returns `None` unless eager changeset caching is enabled. The provider is created before
+    /// execution so it cannot race with the changeset-cache eviction that follows persistence.
+    fn changeset_provider_for(
+        &self,
+        overlay_factory: &OverlayStateProviderFactory<P, N>,
+    ) -> Option<ChangesetProvider<P, N>> {
+        if !self.config.eager_changeset_cache() {
+            return None
+        }
+
+        match overlay_factory.database_provider_ro() {
+            Ok(provider) => Some(provider),
+            Err(err) => {
+                warn!(
+                    target: "engine::tree::changeset",
+                    %err,
+                    "Failed to create changeset provider, block will not be eagerly cached"
+                );
+                None
+            }
+        }
     }
 
     fn calculate_timing_stats(
@@ -1788,8 +1871,9 @@ where
         + ChangeSetReader
         + Clone
         + 'static,
-    OverlayStateProviderFactory<P, N>: DatabaseProviderROFactory<Provider: TrieCursorFactory + HashedCursorFactory>
-        + Clone
+    OverlayStateProviderFactory<P, N>: DatabaseProviderROFactory<
+            Provider: TrieCursorFactory + HashedCursorFactory + Send + 'static,
+        > + Clone
         + 'static,
     N: NodePrimitives,
     V: PayloadValidator<Types, Block = N::Block> + Clone,
@@ -1837,11 +1921,18 @@ where
             &block.execution_output.state,
         );
 
+        let overlay_factory = OverlayStateProviderFactory::new(
+            self.provider.clone(),
+            self.overlay_manager.overlay_builder(block.recovered_block.parent_hash()),
+        );
+        let changeset_provider = self.changeset_provider_for(&overlay_factory);
+
         Ok(self.spawn_deferred_trie_task(
             block.recovered_block,
             block.execution_output,
             LazyHashedPostState::ready(block.hashed_state),
             block.trie_updates,
+            changeset_provider,
         ))
     }
 

@@ -26,10 +26,11 @@ use reth_trie_common::updates::{StorageTrieUpdatesSorted, TrieUpdatesSorted};
 use reth_trie_db::{DatabaseTrieCursorFactory, TrieTableAdapter};
 use std::{
     collections::{BTreeMap, HashMap},
+    fmt,
     ops::RangeInclusive,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
-use tracing::{debug, warn};
+use tracing::{debug, debug_span, warn};
 
 #[cfg(test)]
 use reth_trie::{changesets::compute_trie_changesets, HashedPostStateSorted, TrieInputSorted};
@@ -164,6 +165,103 @@ where
     Ok(TrieUpdatesSorted::new(account_nodes, storage_tries))
 }
 
+/// A pending changeset computation that other threads can wait on.
+///
+/// When an eager changeset producer starts computing changesets for a block, it registers a
+/// pending entry. If another thread needs the same changeset before the computation finishes, it
+/// waits on this entry instead of falling back to the expensive DB-based computation.
+struct PendingChangeset {
+    /// `None` when cancelled (e.g. due to panic), `Some(..)` when resolved with data.
+    result: OnceLock<Option<Arc<TrieUpdatesSorted>>>,
+}
+
+impl PendingChangeset {
+    const fn new() -> Self {
+        Self { result: OnceLock::new() }
+    }
+
+    /// Blocks until the computation finishes. Returns `Some` if resolved with data,
+    /// `None` if the computation was cancelled.
+    fn wait(&self) -> Option<Arc<TrieUpdatesSorted>> {
+        let _span =
+            debug_span!(target: "trie::changeset_cache", "waiting_for_pending_changeset").entered();
+        self.result.wait().clone()
+    }
+
+    /// Resolves the pending computation with the given result, waking all waiters.
+    fn resolve(&self, changesets: Arc<TrieUpdatesSorted>) {
+        let _ = self.result.set(Some(changesets));
+    }
+
+    /// Cancels the pending computation, waking all waiters so they fall through
+    /// to the DB fallback.
+    fn cancel(&self) {
+        let _ = self.result.set(None);
+    }
+}
+
+impl fmt::Debug for PendingChangeset {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let is_resolved = self.result.get().is_some();
+        f.debug_struct("PendingChangeset").field("resolved", &is_resolved).finish()
+    }
+}
+
+/// Guard for a pending changeset computation.
+///
+/// Returned by [`ChangesetCache::register_pending`]. Must be resolved via [`Self::resolve`] to
+/// insert the computed changesets into the cache and wake waiting threads.
+///
+/// If dropped without resolving (e.g. due to a panic), the pending entry is automatically
+/// cancelled so waiters fall through to the DB fallback.
+#[must_use = "call .resolve() to insert changesets into the cache"]
+pub struct PendingChangesetGuard {
+    cache: ChangesetCache,
+    key: ChangesetRangeKey,
+    /// `None` after [`Self::resolve`] has been called.
+    pending: Option<Arc<PendingChangeset>>,
+}
+
+impl PendingChangesetGuard {
+    /// Resolves the pending computation by inserting the changesets into the cache
+    /// and waking all waiting threads.
+    pub fn resolve(mut self, changesets: Arc<TrieUpdatesSorted>) {
+        self.cache.insert_resolved(self.key, changesets);
+        self.pending = None;
+    }
+}
+
+impl fmt::Debug for PendingChangesetGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PendingChangesetGuard").field("key", &self.key).finish()
+    }
+}
+
+impl Drop for PendingChangesetGuard {
+    fn drop(&mut self) {
+        let Some(pending) = self.pending.take() else {
+            // Guard was resolved successfully already, no-op
+            return
+        };
+
+        let mut inner = self.cache.inner.write();
+        let Some(removed) = inner.pending.remove(&self.key) else { return };
+
+        if Arc::ptr_eq(&removed, &pending) {
+            drop(inner);
+            debug!(
+                target: "trie::changeset_cache",
+                key = ?self.key,
+                "Pending changeset dropped without resolution, cancelling"
+            );
+            removed.cancel();
+        } else {
+            // Put it back — it belongs to a different registration.
+            inner.pending.insert(self.key, removed);
+        }
+    }
+}
+
 /// Thread-safe changeset cache.
 ///
 /// This type wraps a shared, mutable reference to the cache inner.
@@ -186,6 +284,39 @@ impl ChangesetCache {
     /// via the `evict()` method to manage memory usage.
     pub(crate) fn new() -> Self {
         Self { inner: Arc::new(RwLock::new(ChangesetCacheInner::new())) }
+    }
+
+    /// Registers a pending changeset computation for the given block.
+    ///
+    /// Call this before starting an eager changeset computation so that concurrent readers wait
+    /// for the result instead of falling back to the expensive DB-based computation.
+    ///
+    /// The returned [`PendingChangesetGuard`] must be used to resolve the pending entry. If it is
+    /// dropped without resolving (e.g. because the computing task panicked), the pending entry is
+    /// removed so waiters fall through to the DB fallback.
+    pub(crate) fn register_pending(
+        &self,
+        block_number: BlockNumber,
+        block_hash: B256,
+    ) -> PendingChangesetGuard {
+        let key = ChangesetRangeKey::single(block_number, block_hash);
+        let pending = Arc::new(PendingChangeset::new());
+        self.inner.write().pending.insert(key, Arc::clone(&pending));
+        PendingChangesetGuard { cache: self.clone(), key, pending: Some(pending) }
+    }
+
+    /// Inserts eagerly computed changesets and wakes any threads waiting on them.
+    fn insert_resolved(&self, key: ChangesetRangeKey, changesets: Arc<TrieUpdatesSorted>) {
+        let pending = {
+            let mut inner = self.inner.write();
+            inner.insert(key, Arc::clone(&changesets));
+            inner.pending.remove(&key)
+        };
+
+        // Resolve outside the write lock so waking waiters cannot contend on it.
+        if let Some(pending) = pending {
+            pending.resolve(changesets);
+        }
     }
 
     /// Evicts changesets for blocks below the given block number.
@@ -362,11 +493,68 @@ impl ChangesetCache {
             );
 
             let block_key = ChangesetRangeKey::single(block_number, block_hash);
-            if let Some(changesets) = self.inner.read().get(&block_key) {
-                cached_reverts.push(changesets);
-            } else {
+
+            // Take the cached entry, or a handle to an in-flight eager computation for it. The
+            // pending map is only ever populated when eager changeset caching is enabled, so this
+            // is a plain map lookup otherwise.
+            let pending = {
+                let inner = self.inner.read();
+                match inner.get(&block_key) {
+                    Some(changesets) => {
+                        cached_reverts.push(changesets);
+                        continue
+                    }
+                    None => inner.pending.get(&block_key).cloned(),
+                }
+            };
+
+            // Waiting on the producer is far cheaper than the aggregate DB fallback below.
+            if let Some(pending) = pending {
+                let wait_start = Instant::now();
+                if let Some(changesets) = pending.wait() {
+                    debug!(
+                        target: "trie::changeset_cache",
+                        block_number,
+                        ?block_hash,
+                        elapsed = ?wait_start.elapsed(),
+                        "Pending changeset resolved for block in range"
+                    );
+                    cached_reverts.push(changesets);
+                    continue
+                }
+
+                debug!(
+                    target: "trie::changeset_cache",
+                    block_number,
+                    ?block_hash,
+                    elapsed = ?wait_start.elapsed(),
+                    "Pending changeset was cancelled, falling through to DB computation"
+                );
+            }
+
+            all_cached = false;
+            break
+        }
+
+        // Merging per-block reverts cannot reproduce a storage wipe across more than one block.
+        // `TrieUpdatesSorted::extend_ref_and_sort`, which backs `merge_slice` below the k-way
+        // threshold, applies oldest-wins precedence to node values but leaves `is_deleted` set by
+        // whichever revert seeded the accumulator. An account destroyed and recreated inside the
+        // range then merges to "delete the storage trie" when the correct revert restores it. Defer
+        // to the aggregate DB computation, which derives the wipe from reverts in one pass.
+        if all_cached && start_block != end_block {
+            let merged_wipe = cached_reverts
+                .iter()
+                .any(|revert| revert.storage_tries_ref().values().any(|trie| trie.is_deleted));
+
+            if merged_wipe {
+                debug!(
+                    target: "trie::changeset_cache",
+                    start_block,
+                    end_block,
+                    "Cached range contains a storage wipe, using aggregate DB computation"
+                );
                 all_cached = false;
-                break
             }
         }
 
@@ -491,6 +679,12 @@ struct ChangesetCacheInner {
     /// Range start block to cache keys mapping for eviction.
     range_starts: BTreeMap<BlockNumber, Vec<ChangesetRangeKey>>,
 
+    /// In-flight eager changeset computations, keyed by single-block range.
+    ///
+    /// Only populated when eager changeset caching is enabled. Threads that need an entry while
+    /// it is being computed wait here instead of running the aggregate DB fallback.
+    pending: HashMap<ChangesetRangeKey, Arc<PendingChangeset>>,
+
     /// Metrics for monitoring cache behavior
     metrics: ChangesetCacheMetrics,
 }
@@ -527,7 +721,12 @@ impl ChangesetCacheInner {
     /// The cache has no capacity limit and relies on explicit eviction
     /// via the `evict()` method to manage memory usage.
     fn new() -> Self {
-        Self { entries: HashMap::new(), range_starts: BTreeMap::new(), metrics: Default::default() }
+        Self {
+            entries: HashMap::new(),
+            range_starts: BTreeMap::new(),
+            pending: HashMap::new(),
+            metrics: Default::default(),
+        }
     }
 
     fn get(&self, key: &ChangesetRangeKey) -> Option<Arc<TrieUpdatesSorted>> {
@@ -1007,6 +1206,470 @@ mod tests {
             reth_trie_db::compute_range_trie_changesets(&*provider, &state_trie_provider, 2..=3, 3)
                 .unwrap();
         assert_eq!(actual, expected);
+    }
+
+    /// Seeds a three-block fixture whose trie is large enough to hold stored branch nodes.
+    ///
+    /// A handful of accounts is not enough: the account trie only persists nodes once it branches,
+    /// so a small fixture makes every changeset empty and any comparison over it vacuous. This
+    /// seeds `ACCOUNT_COUNT` accounts at their post-block-3 values, builds the tip trie from them,
+    /// and then records per-block reverts for a few of those accounts.
+    fn seed_eager_fixture<Provider>(provider: &Provider)
+    where
+        Provider:
+            DBProvider<Tx: DbTxMut> + StageCheckpointWriter + TrieWriter + StorageSettingsCache,
+    {
+        /// Enough accounts for the hashed keys to diverge in the first nibble, which is what
+        /// forces branch nodes to be written to `AccountsTrie`.
+        const ACCOUNT_COUNT: u64 = 256;
+
+        let address_at = |i: u64| Address::from_word(keccak256(i.to_be_bytes()));
+
+        // Tip state: every account present with a distinct balance.
+        for i in 0..ACCOUNT_COUNT {
+            provider
+                .tx_ref()
+                .put::<tables::HashedAccounts>(keccak256(address_at(i)), test_account(1_000 + i))
+                .unwrap();
+        }
+        reth_trie_db::with_adapter!(provider, |A| seed_tip_trie_tables::<_, A>(provider));
+
+        // Per-block reverts: the value each account held before that block changed it. Reverting
+        // blocks 2..=3 therefore has to rewrite the trie nodes covering these two accounts.
+        provider
+            .tx_ref()
+            .put::<tables::AccountChangeSets>(
+                1,
+                AccountBeforeTx { address: address_at(3), info: Some(test_account(1)) },
+            )
+            .unwrap();
+        provider
+            .tx_ref()
+            .put::<tables::AccountChangeSets>(
+                2,
+                AccountBeforeTx { address: address_at(5), info: Some(test_account(2)) },
+            )
+            .unwrap();
+        provider
+            .tx_ref()
+            .put::<tables::AccountChangeSets>(
+                3,
+                AccountBeforeTx { address: address_at(7), info: Some(test_account(3)) },
+            )
+            .unwrap();
+
+        provider.save_stage_checkpoint(StageId::Finish, StageCheckpoint::new(3)).unwrap();
+    }
+
+    /// The aggregate DB fallback for the same range, i.e. what a cache miss would return.
+    fn db_fallback_range<Provider>(
+        provider: &Provider,
+        range: RangeInclusive<BlockNumber>,
+        db_tip: BlockNumber,
+    ) -> TrieUpdatesSorted
+    where
+        Provider: DBProvider
+            + ChangeSetReader
+            + StorageChangeSetReader
+            + BlockNumReader
+            + StorageSettingsCache,
+    {
+        let state_trie_provider = OverlayStateProvider::new(
+            provider,
+            empty_overlay(),
+            provider.cached_storage_settings().is_v2(),
+        );
+        reth_trie_db::compute_range_trie_changesets(provider, &state_trie_provider, range, db_tip)
+            .unwrap()
+    }
+
+    /// The eager producer computes each block's changesets from that block's own trie updates
+    /// against a parent-anchored view. Merging those cached per-block entries must reconstruct
+    /// exactly what the aggregate DB fallback computes for the same range — anything else would
+    /// silently corrupt reorg unwinds, which are the cache's only consumer.
+    #[test]
+    fn eagerly_cached_changesets_match_db_fallback() {
+        let factory = create_test_provider_factory();
+        seed_headers(&factory, 3);
+
+        let provider = factory.provider_rw().unwrap();
+        seed_eager_fixture(&*provider);
+
+        let expected = db_fallback_range(&*provider, 2..=3, 3);
+
+        // Populate the cache the way the eager producer does: register the pending entry, then
+        // resolve it with the changesets computed from the block's own trie updates.
+        let cache = ChangesetCache::new();
+        for block_number in 2..=3u64 {
+            let block_hash = B256::with_last_byte(block_number as u8);
+            let changesets = legacy_compute_block_trie_changesets(&*provider, block_number);
+            cache.register_pending(block_number, block_hash).resolve(Arc::new(changesets));
+        }
+
+        let overlay_manager = OverlayManager::<reth_ethereum_primitives::EthPrimitives>::default();
+        let (partial_state_trie, finish) = database_state_frontiers(&*provider).unwrap();
+        let actual = cache
+            .get_or_compute_range(&overlay_manager, &*provider, 2..=3, partial_state_trie, finish)
+            .unwrap();
+
+        assert!(
+            !expected.account_nodes_ref().is_empty(),
+            "fixture must exercise real trie nodes, otherwise this compares two empty values"
+        );
+        assert_eq!(actual.as_ref(), &expected);
+    }
+
+    /// Same differential check, but over a range that destroys an account holding storage.
+    ///
+    /// A destroyed account wipes its whole storage trie, which the eager path and the aggregate
+    /// fallback reach by different routes: the eager path takes the `is_deleted` branch of
+    /// `compute_trie_changesets` off the block's own trie updates, while the fallback rebuilds the
+    /// wipe from database reverts. This is the case where the two are most likely to diverge, and a
+    /// divergence here corrupts the unwind of any self-destruct block.
+    #[test]
+    fn eagerly_cached_changesets_match_db_fallback_across_storage_wipe() {
+        let factory = create_test_provider_factory();
+        seed_headers(&factory, 3);
+
+        let provider = factory.provider_rw().unwrap();
+        seed_eager_fixture(&*provider);
+
+        // An account with storage that block 2 brought into existence: reverting 2..=3 therefore
+        // has to remove the account and wipe its storage trie.
+        let wiped = Address::with_last_byte(0xee);
+        let hashed_wiped = keccak256(wiped);
+        let slot1 = B256::from(U256::from(1));
+        let slot2 = B256::from(U256::from(2));
+
+        provider.tx_ref().put::<tables::HashedAccounts>(hashed_wiped, test_account(500)).unwrap();
+        for slot in [slot1, slot2] {
+            provider
+                .tx_ref()
+                .put::<tables::HashedStorages>(
+                    hashed_wiped,
+                    StorageEntry { key: keccak256(slot), value: U256::from(7) },
+                )
+                .unwrap();
+        }
+        reth_trie_db::with_adapter!(provider, |A| seed_tip_trie_tables::<_, A>(&*provider));
+
+        // `info: None` at block 2 means the account did not exist before block 2.
+        provider
+            .tx_ref()
+            .put::<tables::AccountChangeSets>(2, AccountBeforeTx { address: wiped, info: None })
+            .unwrap();
+        for slot in [slot1, slot2] {
+            provider
+                .tx_ref()
+                .put::<tables::StorageChangeSets>(
+                    BlockNumberAddress((2, wiped)),
+                    StorageEntry { key: slot, value: U256::ZERO },
+                )
+                .unwrap();
+        }
+
+        let expected = db_fallback_range(&*provider, 2..=3, 3);
+
+        let cache = ChangesetCache::new();
+        for block_number in 2..=3u64 {
+            let block_hash = B256::with_last_byte(block_number as u8);
+            let changesets = legacy_compute_block_trie_changesets(&*provider, block_number);
+            cache.register_pending(block_number, block_hash).resolve(Arc::new(changesets));
+        }
+
+        let overlay_manager = OverlayManager::<reth_ethereum_primitives::EthPrimitives>::default();
+        let (partial_state_trie, finish) = database_state_frontiers(&*provider).unwrap();
+        let actual = cache
+            .get_or_compute_range(&overlay_manager, &*provider, 2..=3, partial_state_trie, finish)
+            .unwrap();
+
+        assert!(
+            expected.storage_tries_ref().contains_key(&hashed_wiped),
+            "fixture must actually revert the destroyed account's storage trie"
+        );
+        assert_eq!(actual.as_ref(), &expected);
+    }
+
+    /// Seeds `address` at the tip holding `slot_count` storage slots.
+    ///
+    /// Pass a large `slot_count` when the storage trie needs to persist branch nodes of its own:
+    /// a trie with only a few slots stores none, which is what hid the lost wipe marker.
+    fn seed_account_with_storage<Provider>(provider: &Provider, address: Address, slot_count: u64)
+    where
+        Provider: DBProvider<Tx: DbTxMut>,
+    {
+        let hashed_address = keccak256(address);
+        provider.tx_ref().put::<tables::HashedAccounts>(hashed_address, test_account(500)).unwrap();
+        for i in 0..slot_count {
+            provider
+                .tx_ref()
+                .put::<tables::HashedStorages>(
+                    hashed_address,
+                    StorageEntry {
+                        key: keccak256(B256::from(U256::from(i))),
+                        value: U256::from(i + 1),
+                    },
+                )
+                .unwrap();
+        }
+    }
+
+    /// Records that `address` and its `slot_count` slots did not exist before `block`, so that
+    /// reverting `block` destroys the account and wipes its storage trie.
+    fn record_account_created_at<Provider>(
+        provider: &Provider,
+        block: BlockNumber,
+        address: Address,
+        slot_count: u64,
+    ) where
+        Provider: DBProvider<Tx: DbTxMut>,
+    {
+        provider
+            .tx_ref()
+            .put::<tables::AccountChangeSets>(block, AccountBeforeTx { address, info: None })
+            .unwrap();
+        for i in 0..slot_count {
+            provider
+                .tx_ref()
+                .put::<tables::StorageChangeSets>(
+                    BlockNumberAddress((block, address)),
+                    StorageEntry { key: B256::from(U256::from(i)), value: U256::ZERO },
+                )
+                .unwrap();
+        }
+    }
+
+    /// Populates `cache` for `range` exactly the way the eager producer does.
+    fn populate_cache_eagerly<Provider>(
+        cache: &ChangesetCache,
+        provider: &Provider,
+        range: RangeInclusive<BlockNumber>,
+    ) where
+        Provider: DBProvider
+            + ChangeSetReader
+            + StorageChangeSetReader
+            + BlockNumReader
+            + StorageSettingsCache,
+    {
+        for block_number in range {
+            let block_hash = B256::with_last_byte(block_number as u8);
+            let changesets = legacy_compute_block_trie_changesets(provider, block_number);
+            cache.register_pending(block_number, block_hash).resolve(Arc::new(changesets));
+        }
+    }
+
+    /// Reads `range` back through `cache`.
+    fn read_range_through_cache<Provider>(
+        cache: &ChangesetCache,
+        provider: &Provider,
+        range: RangeInclusive<BlockNumber>,
+    ) -> Arc<TrieUpdatesSorted>
+    where
+        Provider: DBProvider
+            + ChangeSetReader
+            + StorageChangeSetReader
+            + PruneCheckpointReader
+            + StageCheckpointReader
+            + BlockNumReader
+            + StorageSettingsCache,
+    {
+        let overlay_manager = OverlayManager::<reth_ethereum_primitives::EthPrimitives>::default();
+        let (partial_state_trie, finish) = database_state_frontiers(provider).unwrap();
+        cache
+            .get_or_compute_range(&overlay_manager, provider, range, partial_state_trie, finish)
+            .unwrap()
+    }
+
+    /// The wipe case again, but over a storage trie large enough to hold persisted branch nodes.
+    ///
+    /// Both paths report a wipe wholesale, as `is_deleted` with no node changesets, however large
+    /// the trie was. This pins that down: the deletion marker must survive on the eager side for a
+    /// big trie just as it must for the empty one, and neither path may start enumerating nodes.
+    #[test]
+    fn eagerly_cached_changesets_match_db_fallback_across_wipe_with_persisted_nodes() {
+        let factory = create_test_provider_factory();
+        seed_headers(&factory, 3);
+
+        let provider = factory.provider_rw().unwrap();
+        seed_eager_fixture(&*provider);
+
+        let wiped = Address::with_last_byte(0xee);
+        let hashed_wiped = keccak256(wiped);
+        seed_account_with_storage(&*provider, wiped, 256);
+        reth_trie_db::with_adapter!(provider, |A| seed_tip_trie_tables::<_, A>(&*provider));
+        record_account_created_at(&*provider, 2, wiped, 256);
+
+        let expected = db_fallback_range(&*provider, 2..=3, 3);
+
+        let cache = ChangesetCache::new();
+        populate_cache_eagerly(&cache, &*provider, 2..=3);
+        let actual = read_range_through_cache(&cache, &*provider, 2..=3);
+
+        let wipe = expected
+            .storage_tries_ref()
+            .get(&hashed_wiped)
+            .expect("fixture must revert the destroyed account's storage trie");
+        assert!(wipe.is_deleted, "the revert must mark the storage trie deleted");
+        assert_eq!(actual.as_ref(), &expected);
+    }
+
+    /// An account destroyed and then recreated inside the same range.
+    ///
+    /// The range revert has to restore the account as it was before the destruction, which means
+    /// the older per-block revert must win over the newer one. This is the case where the cache's
+    /// `merge_slice` precedence and the fallback's single aggregate computation could disagree.
+    #[test]
+    fn eagerly_cached_changesets_match_db_fallback_across_wipe_then_recreate() {
+        let factory = create_test_provider_factory();
+        seed_headers(&factory, 4);
+
+        let provider = factory.provider_rw().unwrap();
+        seed_eager_fixture(&*provider);
+
+        let churned = Address::with_last_byte(0xdd);
+        let hashed_churned = keccak256(churned);
+        seed_account_with_storage(&*provider, churned, 64);
+        reth_trie_db::with_adapter!(provider, |A| seed_tip_trie_tables::<_, A>(&*provider));
+
+        // Block 2 destroyed the account: before it, the account held these slot values.
+        provider
+            .tx_ref()
+            .put::<tables::AccountChangeSets>(
+                2,
+                AccountBeforeTx { address: churned, info: Some(test_account(900)) },
+            )
+            .unwrap();
+        for i in 0..64u64 {
+            provider
+                .tx_ref()
+                .put::<tables::StorageChangeSets>(
+                    BlockNumberAddress((2, churned)),
+                    StorageEntry { key: B256::from(U256::from(i)), value: U256::from(i + 1_000) },
+                )
+                .unwrap();
+        }
+        // Block 3 recreated it, so before block 3 it did not exist.
+        record_account_created_at(&*provider, 3, churned, 64);
+        provider.save_stage_checkpoint(StageId::Finish, StageCheckpoint::new(4)).unwrap();
+
+        let expected = db_fallback_range(&*provider, 2..=3, 4);
+
+        let cache = ChangesetCache::new();
+        populate_cache_eagerly(&cache, &*provider, 2..=3);
+        let actual = read_range_through_cache(&cache, &*provider, 2..=3);
+
+        assert!(
+            expected.storage_tries_ref().contains_key(&hashed_churned),
+            "fixture must revert the churned account's storage trie"
+        );
+        assert_eq!(actual.as_ref(), &expected);
+    }
+
+    /// A range whose oldest block has already been evicted must fall back, not answer from the
+    /// partially populated cache.
+    ///
+    /// This is the retention edge: the cache keeps a bounded window, so a consumer asking across
+    /// it will find some blocks cached and some gone. Answering from the surviving subset would
+    /// silently return a revert that stops short of the range start.
+    #[test]
+    fn partially_evicted_range_falls_back_and_still_matches_db() {
+        let factory = create_test_provider_factory();
+        seed_headers(&factory, 3);
+
+        let provider = factory.provider_rw().unwrap();
+        seed_eager_fixture(&*provider);
+
+        let expected = db_fallback_range(&*provider, 2..=3, 3);
+
+        let cache = ChangesetCache::new();
+        populate_cache_eagerly(&cache, &*provider, 2..=3);
+
+        // Drop block 2's entry, leaving block 3 cached.
+        cache.evict(3);
+        assert!(
+            cache
+                .inner
+                .read()
+                .get(&ChangesetRangeKey::single(2, B256::with_last_byte(2)))
+                .is_none(),
+            "block 2 must be evicted for this to test the retention edge"
+        );
+
+        let actual = read_range_through_cache(&cache, &*provider, 2..=3);
+        assert_eq!(actual.as_ref(), &expected);
+    }
+
+    /// A reader that arrives while the producer is still computing must wait for it rather than
+    /// run the aggregate DB fallback. Resolving with a value the DB could never produce proves
+    /// which path the reader took.
+    #[test]
+    fn pending_changeset_is_awaited_instead_of_db_fallback() {
+        let factory = create_test_provider_factory();
+        seed_headers(&factory, 3);
+
+        let provider = factory.provider_rw().unwrap();
+        seed_eager_fixture(&*provider);
+
+        let path = Nibbles::from_nibbles([0xa, 0xb]);
+        let sentinel_node = BranchNodeCompact::new(0b0100, 0, 0, vec![], None);
+        let sentinel = Arc::new(TrieUpdatesSorted::new(
+            vec![(path, Some(sentinel_node.clone()))],
+            B256Map::default(),
+        ));
+
+        let cache = ChangesetCache::new();
+        let guard = cache.register_pending(3, B256::with_last_byte(3));
+
+        let reader = std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                let overlay_manager =
+                    OverlayManager::<reth_ethereum_primitives::EthPrimitives>::default();
+                let (partial_state_trie, finish) = database_state_frontiers(&*provider).unwrap();
+                cache
+                    .get_or_compute_range(
+                        &overlay_manager,
+                        &*provider,
+                        3..=3,
+                        partial_state_trie,
+                        finish,
+                    )
+                    .unwrap()
+            });
+
+            // Give the reader a chance to reach the wait. If it does not get there first the
+            // entry is simply a cache hit, so this cannot flake either way.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            guard.resolve(Arc::clone(&sentinel));
+
+            handle.join().unwrap()
+        });
+
+        assert_eq!(reader.account_nodes_ref(), &[(path, Some(sentinel_node))]);
+    }
+
+    /// If the producer dies its guard drops unresolved. Waiters must then be released to the DB
+    /// fallback and still get the correct answer, so a failed eager computation degrades to
+    /// current behavior instead of hanging or returning something wrong.
+    #[test]
+    fn cancelled_pending_changeset_falls_back_to_db() {
+        let factory = create_test_provider_factory();
+        seed_headers(&factory, 3);
+
+        let provider = factory.provider_rw().unwrap();
+        seed_eager_fixture(&*provider);
+
+        let expected = db_fallback_range(&*provider, 3..=3, 3);
+
+        let cache = ChangesetCache::new();
+        drop(cache.register_pending(3, B256::with_last_byte(3)));
+
+        let overlay_manager = OverlayManager::<reth_ethereum_primitives::EthPrimitives>::default();
+        let (partial_state_trie, finish) = database_state_frontiers(&*provider).unwrap();
+        let actual = cache
+            .get_or_compute_range(&overlay_manager, &*provider, 3..=3, partial_state_trie, finish)
+            .unwrap();
+
+        assert_eq!(actual.as_ref(), &expected);
     }
 
     #[test]

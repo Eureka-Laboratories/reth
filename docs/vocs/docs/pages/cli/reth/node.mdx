@@ -1122,6 +1122,15 @@ Engine:
       --engine.disable-bal-batch-io
           Disable BAL (Block Access List) storage prefetch IO during prewarming. When set, BAL storage slots are not read into the execution cache
 
+      --engine.eager-changeset-cache
+          Eagerly compute and cache each validated block's trie changesets in the background.
+
+          Without this the changeset cache is filled only by its own miss handler, so any consumer that cannot be served from the in-memory chain falls back to an aggregate DB computation. At the default persistence settings the in-memory chain absorbs those reads, but with a low `--engine.persistence-threshold` blocks leave memory as soon as they are persisted and the fallback runs synchronously on every block.
+
+          Enable this when running a low persistence threshold, typically because an external process reads the node's database directly and needs every block persisted immediately.
+
+          [env: RETH_ENGINE_EAGER_CHANGESET_CACHE=]
+
 ERA:
       --era.enable
           Enable import from ERA1 files

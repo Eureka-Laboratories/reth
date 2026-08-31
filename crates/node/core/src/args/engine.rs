@@ -566,6 +566,23 @@ pub struct EngineArgs {
     #[arg(long = "engine.disable-bal-batch-io", default_value_t = false)]
     pub disable_bal_batch_io: bool,
 
+    /// Eagerly compute and cache each validated block's trie changesets in the background.
+    ///
+    /// Without this the changeset cache is filled only by its own miss handler, so any consumer
+    /// that cannot be served from the in-memory chain falls back to an aggregate DB computation.
+    /// At the default persistence settings the in-memory chain absorbs those reads, but with a low
+    /// `--engine.persistence-threshold` blocks leave memory as soon as they are persisted and the
+    /// fallback runs synchronously on every block.
+    ///
+    /// Enable this when running a low persistence threshold, typically because an external process
+    /// reads the node's database directly and needs every block persisted immediately.
+    #[arg(
+        long = "engine.eager-changeset-cache",
+        env = "RETH_ENGINE_EAGER_CHANGESET_CACHE",
+        default_value_t = false
+    )]
+    pub eager_changeset_cache: bool,
+
     /// Add random jitter before each proof computation (trie-debug only).
     /// Each proof worker sleeps for a random duration up to this value before
     /// starting work. Useful for stress-testing timing-sensitive proof logic.
@@ -656,6 +673,7 @@ impl Default for EngineArgs {
             bal_parallel_execution_disabled,
             bal_parallel_state_root_disabled,
             disable_bal_batch_io: false,
+            eager_changeset_cache: false,
             #[cfg(feature = "trie-debug")]
             proof_jitter: None,
         }
@@ -755,7 +773,8 @@ impl EngineArgs {
             .with_suppress_persistence_during_build(self.suppress_persistence_during_build)
             .without_bal_parallel_execution(self.bal_parallel_execution_disabled)
             .without_bal_parallel_state_root(self.bal_parallel_state_root_disabled)
-            .without_bal_batch_io(self.disable_bal_batch_io);
+            .without_bal_batch_io(self.disable_bal_batch_io)
+            .with_eager_changeset_cache(self.eager_changeset_cache);
         #[cfg(feature = "trie-debug")]
         let config = config.with_proof_jitter(self.proof_jitter);
         config
@@ -916,6 +935,7 @@ mod tests {
             bal_parallel_execution_disabled: true,
             bal_parallel_state_root_disabled: true,
             disable_bal_batch_io: true,
+            eager_changeset_cache: true,
             #[cfg(feature = "trie-debug")]
             proof_jitter: None,
         };
@@ -960,6 +980,7 @@ mod tests {
             "--engine.disable-bal-parallel-execution",
             "--engine.disable-bal-parallel-state-root",
             "--engine.disable-bal-batch-io",
+            "--engine.eager-changeset-cache",
         ])
         .args;
 
