@@ -214,6 +214,13 @@ pub struct TreeConfig {
     /// This trusts the block header's state root. It is intended for experiments that measure
     /// execution without trie state-root work.
     skip_state_root: bool,
+    /// Whether to eagerly compute and cache each validated block's trie changesets.
+    ///
+    /// Without this the changeset cache is populated only by its own miss handler, so consumers
+    /// that cannot be served from the in-memory chain pay a synchronous aggregate DB computation.
+    /// That is invisible at the default persistence settings but costs a full recomputation per
+    /// block once `persistence_threshold` is low enough that blocks leave memory immediately.
+    eager_changeset_cache: bool,
     /// Maximum random jitter applied before each proof computation (trie-debug only).
     /// When set, each proof worker sleeps for a random duration up to this value
     /// before starting a proof calculation.
@@ -266,6 +273,7 @@ impl Default for TreeConfig {
             disable_bal_parallel_state_root: false,
             disable_bal_batch_io: false,
             skip_state_root: false,
+            eager_changeset_cache: false,
             #[cfg(feature = "trie-debug")]
             proof_jitter: None,
         }
@@ -346,6 +354,7 @@ impl TreeConfig {
             disable_bal_parallel_state_root: false,
             disable_bal_batch_io: false,
             skip_state_root: false,
+            eager_changeset_cache: false,
             #[cfg(feature = "trie-debug")]
             proof_jitter: None,
         }
@@ -784,6 +793,17 @@ impl TreeConfig {
     /// Setter for whether to disable BAL state prefetching during prewarm.
     pub const fn without_bal_batch_io(mut self, disable_bal_batch_io: bool) -> Self {
         self.disable_bal_batch_io = disable_bal_batch_io;
+        self
+    }
+
+    /// Returns whether each validated block's trie changesets are eagerly cached.
+    pub const fn eager_changeset_cache(&self) -> bool {
+        self.eager_changeset_cache
+    }
+
+    /// Setter for whether to eagerly compute and cache each validated block's trie changesets.
+    pub const fn with_eager_changeset_cache(mut self, eager_changeset_cache: bool) -> Self {
+        self.eager_changeset_cache = eager_changeset_cache;
         self
     }
 

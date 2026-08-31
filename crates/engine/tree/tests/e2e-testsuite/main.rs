@@ -516,3 +516,30 @@ async fn test_engine_tree_disk_reorg_v2_e2e() -> Result<()> {
     disk_reorg_test(true).run::<EthereumNode>().await?;
     Ok(())
 }
+
+/// Same disk-level reorg, but with eager changeset caching and the persistence settings it exists
+/// for: every block persists immediately and leaves memory, so the reorg unwind is served from
+/// eagerly cached changesets rather than from the in-memory chain or the DB fallback.
+///
+/// Reorg unwind is the changeset cache's only consumer, so this is what proves eagerly computed
+/// changesets are usable and not merely present.
+#[tokio::test]
+async fn test_engine_tree_disk_reorg_eager_changeset_cache_e2e() -> Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let mut builder = disk_reorg_test(false);
+    builder = builder.with_setup(
+        disk_reorg_setup(false).with_tree_config(
+            // Set in this order: each setter asserts the masking invariant, which only tolerates a
+            // zero persistence threshold once the masking window is itself zero.
+            TreeConfig::default()
+                .with_has_enough_parallelism(true)
+                .with_num_state_masking_blocks(0)
+                .with_memory_block_buffer_target(0)
+                .with_persistence_threshold(0)
+                .with_eager_changeset_cache(true),
+        ),
+    );
+    builder.run::<EthereumNode>().await?;
+    Ok(())
+}

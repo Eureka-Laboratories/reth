@@ -6,7 +6,7 @@
 
 use crate::{
     changeset_cache::compute_block_trie_updates, database_state_frontiers, ChangesetCache,
-    OverlayBuilder,
+    OverlayBuilder, PendingChangesetGuard,
 };
 use alloy_eips::BlockNumHash;
 use alloy_primitives::{BlockNumber, B256};
@@ -155,6 +155,20 @@ impl<N: NodePrimitives> OverlayManager<N> {
     /// Evicts cached changesets for blocks below `up_to_block`.
     pub fn evict_cached_changesets(&self, up_to_block: BlockNumber) {
         self.changeset_cache.evict(up_to_block);
+    }
+
+    /// Registers an in-flight eager changeset computation for `(block_number, block_hash)`.
+    ///
+    /// Readers that need this block's changesets before the computation finishes wait on the
+    /// returned guard's entry instead of running the aggregate DB fallback. The guard must be
+    /// resolved with the computed changesets; dropping it unresolved releases the waiters to the
+    /// fallback.
+    pub fn register_pending_changeset(
+        &self,
+        block_number: BlockNumber,
+        block_hash: B256,
+    ) -> PendingChangesetGuard {
+        self.changeset_cache.register_pending(block_number, block_hash)
     }
 
     /// Computes the trie updates produced by `block_number`.

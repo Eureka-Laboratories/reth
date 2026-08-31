@@ -7,6 +7,7 @@ pub use builder::*;
 
 mod changeset_cache;
 pub(crate) use changeset_cache::ChangesetCache;
+pub use changeset_cache::PendingChangesetGuard;
 
 mod manager;
 pub use manager::*;
